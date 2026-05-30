@@ -1,7 +1,7 @@
 from flask import Flask, request, Response
 from PIL import Image, ImageDraw, ImageFont
 import requests as req
-import io, os
+import re, io, os
 
 app = Flask(__name__)
 
@@ -13,39 +13,65 @@ GRAY       = (136, 136, 136)  # body text
 DIM        = (85,  85,  85)   # slide counter
 SIZE       = 1080
 
-# ── Font setup (downloaded once on cold start) ──────────────────
+# ── Font setup ──────────────────────────────────────────────────
 FONT_DIR = '/tmp/fonts'
 os.makedirs(FONT_DIR, exist_ok=True)
 
-FONT_URLS = {
-    'playfair_bold': 'https://github.com/google/fonts/raw/main/ofl/playfairdisplay/static/PlayfairDisplay-Bold.ttf',
-    'inter_regular': 'https://github.com/google/fonts/raw/main/ofl/inter/static/Inter-Regular.ttf',
-    'inter_bold':    'https://github.com/google/fonts/raw/main/ofl/inter/static/Inter-Bold.ttf',
+# Old browser UA tricks Google Fonts into serving legacy TTF format
+LEGACY_UA = 'Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)'
+
+FONT_SPECS = {
+    'playfair_bold': 'Playfair+Display:700',
+    'inter_regular': 'Inter:400',
+    'inter_bold':    'Inter:700',
 }
 
 def download_fonts():
-    for name, url in FONT_URLS.items():
+    for name, spec in FONT_SPECS.items():
         path = f'{FONT_DIR}/{name}.ttf'
-        if not os.path.exists(path):
-            print(f'Downloading font: {name}...')
-            r = req.get(url, timeout=20)
-            r.raise_for_status()
-            with open(path, 'wb') as f:
-                f.write(r.content)
-            print(f'Done: {name}')
+        if os.path.exists(path):
+            continue
+        print(f'Downloading font: {name}...')
+        try:
+            # Google Fonts CSS v1 returns TTF URLs for old user agents
+            css = req.get(
+                f'https://fonts.googleapis.com/css?family={spec}',
+                headers={'User-Agent': LEGACY_UA},
+                timeout=15
+            ).text
+            ttf_urls = re.findall(r"url\(([^)]+\.ttf)\)", css)
+            if ttf_urls:
+                data = req.get(ttf_urls[0], timeout=15).content
+                with open(path, 'wb') as f:
+                    f.write(data)
+                print(f'Done: {name}')
+            else:
+                print(f'WARNING: No TTF URL found for {name}')
+        except Exception as e:
+            print(f'WARNING: Could not download {name}: {e}')
 
 download_fonts()
 
 def fnt(name, size):
-    return ImageFont.truetype(f'{FONT_DIR}/{name}.ttf', size)
+    """Load font with fallback to system DejaVu if download failed."""
+    path = f'{FONT_DIR}/{name}.ttf'
+    if os.path.exists(path):
+        return ImageFont.truetype(path, size)
+    # Fallback: DejaVu fonts (pre-installed on Render's Linux)
+    for fb in [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+    ]:
+        if os.path.exists(fb):
+            return ImageFont.truetype(fb, size)
+    return ImageFont.load_default()
 
 # ── Drawing helpers ─────────────────────────────────────────────
 def tw(d, text, font):
-    """Text width in pixels."""
     return d.textbbox((0, 0), text, font=font)[2]
 
 def wrap(d, text, font, max_w):
-    """Word-wrap text to fit max_w pixels."""
     words, lines, cur = text.split(), [], ''
     for w in words:
         test = (cur + ' ' + w).strip()
@@ -58,7 +84,6 @@ def wrap(d, text, font, max_w):
     return lines or ['']
 
 def draw_colored(d, x, y, text, green_phrase, font):
-    """Draw text with a keyword highlighted in green."""
     if not green_phrase or green_phrase.lower() not in text.lower():
         d.text((x, y), text, fill=WHITE, font=font)
         return
@@ -68,23 +93,19 @@ def draw_colored(d, x, y, text, green_phrase, font):
     a  = text[i+len(green_phrase):]
     cx = x
     if b:  d.text((cx, y), b,  fill=WHITE,  font=font); cx += tw(d, b,  font)
-    d.text((cx, y), ph, fill=GREEN, font=font); cx += tw(d, ph, font)
+    d.text((cx, y), ph, fill=GREEN, font=font);          cx += tw(d, ph, font)
     if a:  d.text((cx, y), a,  fill=WHITE,  font=font)
 
 def brackets(d):
-    """Draw GP Systems corner brackets."""
-    M, A, T = 22, 45, 3
-    S = SIZE
-    lines = [
-        [(M, M), (M+A, M)], [(M, M), (M, M+A)],           # top-left
-        [(S-M, M), (S-M-A, M)], [(S-M, M), (S-M, M+A)],   # top-right
-        [(M, S-M), (M+A, S-M)], [(M, S-M), (M, S-M-A)],   # bottom-left
-    ]
-    for pts in lines:
+    M, A, T, S = 22, 45, 3, SIZE
+    for pts in [
+        [(M,M),(M+A,M)], [(M,M),(M,M+A)],
+        [(S-M,M),(S-M-A,M)], [(S-M,M),(S-M,M+A)],
+        [(M,S-M),(M+A,S-M)], [(M,S-M),(M,S-M-A)],
+    ]:
         d.line(pts, fill=GREEN, width=T)
 
 def bottom_bar(d, n, total, fi_br, fi_cnt):
-    """Draw slide counter and GP Systems brand name."""
     cnt = f'{str(n).zfill(2)} / {str(total).zfill(2)}'
     d.text((32, 1050), cnt, fill=DIM, font=fi_cnt)
     d.text((810, 1047), 'GP ', fill=WHITE, font=fi_br)
@@ -94,17 +115,16 @@ def bottom_bar(d, n, total, fi_br, fi_cnt):
 @app.route('/slide')
 def slide():
     n     = int(request.args.get('n', 1))
-    h     = request.args.get('h', '')          # headline
-    g     = request.args.get('g', '')          # green keyword
-    b     = request.args.get('b', '')          # body text
-    s     = request.args.get('s', '')          # subtext (hook / CTA)
-    l     = request.args.get('l', '')          # custom slide label (e.g. "THE PROBLEM")
+    h     = request.args.get('h', '')
+    g     = request.args.get('g', '')
+    b     = request.args.get('b', '')
+    s     = request.args.get('s', '')
+    l     = request.args.get('l', '')
     total = int(request.args.get('total', 6))
 
     img = Image.new('RGB', (SIZE, SIZE), (0, 0, 0))
     d   = ImageDraw.Draw(img)
 
-    # Load fonts
     fp_huge = fnt('playfair_bold', 250)
     fp_h1   = fnt('playfair_bold', 70)
     fp_h2   = fnt('playfair_bold', 60)
@@ -116,54 +136,43 @@ def slide():
 
     brackets(d)
 
-    # ── Slide 1: Hook ──────────────────────────────────────────
-    if n == 1:
+    if n == 1:  # ── Hook ──
         lbl = 'G P   S Y S T E M S'
         d.text(((SIZE - tw(d, lbl, fi_sm)) // 2, 155), lbl, fill=GREEN, font=fi_sm)
-
         y = 290
         for line in wrap(d, h, fp_h1, 960):
             draw_colored(d, (SIZE - tw(d, line, fp_h1)) // 2, y, line, g, fp_h1)
             y += 92
-
         if s:
             y += 20
             for line in wrap(d, s, fi_body, 860):
                 d.text(((SIZE - tw(d, line, fi_body)) // 2, y), line, fill=GRAY, font=fi_body)
                 y += 38
 
-    # ── Slides 2 to (total-1): Content ────────────────────────
-    elif n < total:
+    elif n < total:  # ── Content ──
         sn = str(n - 1).zfill(2)
         d.text((740, -10), sn, fill=DARK_GREEN, font=fp_huge)
-        # Use custom label if provided, otherwise default to STEP format
         slide_label = l.upper() if l else f'S T E P   {sn}'
         d.text((60, 265), slide_label, fill=GREEN, font=fi_sm)
-
         y = 315
         for line in wrap(d, h, fp_h1, 860):
             draw_colored(d, 60, y, line, g, fp_h1)
             y += 90
-
         y += 10
         d.rectangle([(60, y), (105, y + 3)], fill=GREEN)
         y += 28
-
         if b:
             lines = wrap(d, b, fi_body, 960)
             for i, line in enumerate(lines):
-                color = WHITE if i == 0 else GRAY
-                font  = fi_bold if i == 0 else fi_body
-                d.text((60, y), line, fill=color, font=font)
+                d.text((60, y), line, fill=WHITE if i == 0 else GRAY,
+                       font=fi_bold if i == 0 else fi_body)
                 y += 38
 
-    # ── Slide 6: CTA ──────────────────────────────────────────
-    else:
+    else:  # ── CTA ──
         y = 380
         for line in wrap(d, h, fp_h2, 900):
             draw_colored(d, (SIZE - tw(d, line, fp_h2)) // 2, y, line, g, fp_h2)
             y += 80
-
         if s:
             y += 24
             for line in wrap(d, s, fi_body, 860):
@@ -176,7 +185,6 @@ def slide():
     img.save(buf, format='PNG')
     return Response(buf.getvalue(), mimetype='image/png')
 
-# ── Health check (used by n8n to wake the service) ──────────────
 @app.route('/health')
 def health():
     return 'OK', 200
