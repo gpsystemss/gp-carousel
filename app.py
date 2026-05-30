@@ -1,7 +1,7 @@
 from flask import Flask, request, Response
 from PIL import Image, ImageDraw, ImageFont
 import requests as req
-import re, io, os
+import re, io, os, threading
 
 app = Flask(__name__)
 
@@ -50,7 +50,8 @@ def download_fonts():
         except Exception as e:
             print(f'WARNING: Could not download {name}: {e}')
 
-download_fonts()
+# Download fonts in background so server starts instantly on cold boot
+threading.Thread(target=download_fonts, daemon=True).start()
 
 def fnt(name, size):
     """Load font with fallback to system DejaVu if download failed."""
